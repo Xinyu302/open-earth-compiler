@@ -444,25 +444,26 @@ def Stencil_ApplyOp : Stencil_Op<"apply", [
 
   let arguments = (ins Variadic<AnyType>:$operands,
                         OptionalAttr<Stencil_Index>:$lb, 
-                        OptionalAttr<Stencil_Index>:$ub);
+                        OptionalAttr<Stencil_Index>:$ub,
+                     DefaultValuedAttr<StrAttr, "uname">:$name);
   let results = (outs Variadic<Stencil_Temp>:$res);
   let regions = (region SizedRegion<1>:$region);
   let hasCanonicalizer = 1;
   
   let builders = [
-    OpBuilderDAG<(ins "TypeRange":$resultTypes, "ValueRange":$operands, "Optional<ArrayAttr>":$lb, "Optional<ArrayAttr>":$ub), 
+    OpBuilderDAG<(ins "TypeRange":$resultTypes, "ValueRange":$operands, "Optional<ArrayAttr>":$lb, "Optional<ArrayAttr>":$ub),
     [{
       $_state.addOperands(operands);
       if(lb.hasValue() && ub.hasValue()) {
         $_state.addAttribute(getLBAttrName(), lb.getValue());
-        $_state.addAttribute(getUBAttrName(), ub.getValue()); 
+        $_state.addAttribute(getUBAttrName(), ub.getValue());
       }
-      auto region = $_state.addRegion(); 
+      auto region = $_state.addRegion();
       region->push_back(new Block());
       region->front().addArguments(operands.getTypes());
       $_state.addTypes(resultTypes);
     }]>,
-    OpBuilderDAG<(ins "TypeRange":$resultTypes, "Optional<ArrayAttr>":$lb, "Optional<ArrayAttr>":$ub), 
+    OpBuilderDAG<(ins "TypeRange":$resultTypes, "Optional<ArrayAttr>":$lb, "Optional<ArrayAttr>":$ub),
     [{
       if(lb.hasValue() && ub.hasValue()) {
         $_state.addAttribute(getLBAttrName(), lb.getValue());
@@ -500,6 +501,7 @@ def Stencil_ApplyOp : Stencil_Op<"apply", [
     bool hasOnlyEmptyStores();
     static StringRef getLBAttrName() { return "lb"; }
     static StringRef getUBAttrName() { return "ub"; }
+    static StringRef getStencilNameAttrName() { return "name"; }
     Block *getBody() { return &region().front(); }
     ShapeOp getCombineTreeRootShape();
   }];
