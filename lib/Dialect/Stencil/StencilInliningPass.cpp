@@ -196,7 +196,16 @@ struct RerouteRewrite : public StencilInliningPattern {
 
             if (isStencilInliningPossible(producerOp, applyOp) &&
                 isStencilReroutingPossible(producerOp, applyOp))
+            {
+              llvm::errs() << "stencil reroute input:\n";
+              llvm::errs() << "producer:";
+              producerOp.print(llvm::errs());
+              llvm::errs() << "\n";
+              llvm::errs() << "consumer:";
+              applyOp.print(llvm::errs());
+              llvm::errs() << "\n";
               return redirectStore(producerOp, applyOp, rewriter);
+            }
           }
         }
       }
@@ -207,7 +216,16 @@ struct RerouteRewrite : public StencilInliningPattern {
               dyn_cast_or_null<stencil::ApplyOp>(operand.getDefiningOp())) {
         if (isStencilInliningPossible(producerOp, applyOp) &&
             isStencilReroutingPossible(producerOp, applyOp))
-          return redirectStore(producerOp, applyOp, rewriter);
+            {
+              llvm::errs() << "stencil reroute output:\n";
+              llvm::errs() << "producer:";
+              producerOp.print(llvm::errs());
+              llvm::errs() << "\n";
+              llvm::errs() << "consumer:";
+              applyOp.print(llvm::errs());
+              llvm::errs() << "\n";
+              return redirectStore(producerOp, applyOp, rewriter);
+            }
       }
     }
     return failure();
@@ -338,6 +356,13 @@ struct InliningRewrite : public StencilInliningPattern {
         // Try the next producer if inlining the current one is not possible
         if (isStencilInliningPossible(producerOp, applyOp) &&
             hasSingleConsumer(producerOp, applyOp)) {
+          llvm::errs() << "stencil inline:\n";
+          llvm::errs() << "producer:";
+          producerOp.print(llvm::errs());
+          llvm::errs() << "\n";
+          llvm::errs() << "consumer:";
+          applyOp.print(llvm::errs());
+          llvm::errs() << "\n";
           return inlineProducer(producerOp, applyOp, producerOp.getResults(),
                                 rewriter);
         }
