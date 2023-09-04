@@ -36,7 +36,7 @@ static ParseResult parseApplyOp(OpAsmParser &parser, OperationState &state) {
   SmallVector<OpAsmParser::OperandType, 8> operands;
   SmallVector<OpAsmParser::OperandType, 8> arguments;
   SmallVector<Type, 8> operandTypes;
-
+  
   // Parse the assignment list
   if (succeeded(parser.parseOptionalLParen())) {
     do {
@@ -91,7 +91,6 @@ static ParseResult parseApplyOp(OpAsmParser &parser, OperationState &state) {
 }
 
 static void print(stencil::ApplyOp applyOp, OpAsmPrinter &printer) {
-  printer << stencil::ApplyOp::getOperationName() << ' ';
   // Print the region arguments
   SmallVector<Value, 10> operands = applyOp.getOperands();
   if (!applyOp.region().empty() && !operands.empty()) {
