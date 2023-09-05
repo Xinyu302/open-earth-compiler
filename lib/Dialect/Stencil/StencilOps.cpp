@@ -421,7 +421,7 @@ stencil::ApplyOpPattern::cleanupOpArguments(stencil::ApplyOp applyOp,
     auto loc = applyOp.getLoc();
     auto newOp = rewriter.create<stencil::ApplyOp>(
         loc, applyOp.getResultTypes(), newOperands, applyOp.lb(), applyOp.ub());
-
+    newOp->setAttr("name", applyOp.nameAttr());
     // Compute the argument mapping and move the block
     SmallVector<Value, 10> newArgs(applyOp.getNumOperands());
     llvm::transform(applyOp.getOperands(), newArgs.begin(), [&](Value value) {

@@ -128,6 +128,9 @@ struct RerouteRewrite : public StencilInliningPattern {
     auto newOp = rewriter.create<stencil::ApplyOp>(
         consumerOp.getLoc(), newResultTypes, newOperands, consumerOp.lb(),
         consumerOp.ub());
+    std::string newName = "fused_" + producerOp.nameAttr().getValue().str() + "_" + consumerOp.nameAttr().getValue().str();
+    auto nameAttr = rewriter.getStringAttr(newName);
+    newOp->setAttr("name", nameAttr);
     rewriter.mergeBlocks(consumerOp.getBody(), newOp.getBody(),
                          newOp.getBody()->getArguments().take_front(
                              consumerOp.getNumOperands()));
@@ -252,6 +255,9 @@ struct InliningRewrite : public StencilInliningPattern {
     auto buildOp = rewriter.create<stencil::ApplyOp>(
         loc, consumerOp.getResultTypes(), buildOperands, consumerOp.lb(),
         consumerOp.ub());
+    std::string newName = "fused_" + producerOp.nameAttr().getValue().str() + "_" + consumerOp.nameAttr().getValue().str();
+    auto nameAttr = rewriter.getStringAttr(newName);
+    buildOp->setAttr("name", nameAttr);
     rewriter.mergeBlocks(consumerOp.getBody(), buildOp.getBody(),
                          buildOp.getBody()->getArguments().take_back(
                              consumerOp.getNumOperands()));

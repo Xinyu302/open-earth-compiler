@@ -22,7 +22,7 @@ std::unique_ptr<OperationPass<FuncOp>> createStorageMaterializationPass();
 
 std::unique_ptr<OperationPass<FuncOp>> createPeelOddIterationsPass();
 
-std::unique_ptr<OperationPass<FuncOp>> createCustomFusionPass();
+// std::unique_ptr<OperationPass<FuncOp>> createCustomFusionPass();
 
 //===----------------------------------------------------------------------===//
 // Registration

@@ -13,15 +13,15 @@ def StencilInliningPass : FunctionPass<"stencil-inlining"> {
   let constructor = "mlir::createStencilInliningPass()";
 }
 
-def CustomFusionPass: FunctionPass<"custom-fusion"> {
-  let summary = "Fuse stencil user defined";
-  let constructor = "mlir::createCustomFusionPass()";
-  let options = [
-    ListOption<"fused_apply", "fused_apply", "std::string",
-             "apply ops to be fused",
-             "llvm::cl::MiscFlags::CommaSeparated">
-  ];
-}
+// def CustomFusionPass: FunctionPass<"custom-fusion"> {
+//   let summary = "Fuse stencil user defined";
+//   let constructor = "mlir::createCustomFusionPass()";
+//   let options = [
+//     ListOption<"fused_apply", "fused_apply", "std::string",
+//              "apply ops to be fused",
+//              "llvm::cl::MiscFlags::CommaSeparated">
+//   ];
+// }
 
 def StencilUnrollingPass : FunctionPass<"stencil-unrolling"> {
   let summary = "Unroll stencil apply ops";
