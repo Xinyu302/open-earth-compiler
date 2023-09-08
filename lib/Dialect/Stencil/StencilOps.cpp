@@ -91,6 +91,7 @@ static ParseResult parseApplyOp(OpAsmParser &parser, OperationState &state) {
 }
 
 static void print(stencil::ApplyOp applyOp, OpAsmPrinter &printer) {
+  printer << stencil::ApplyOp::getOperationName() << ' ';
   // Print the region arguments
   SmallVector<Value, 10> operands = applyOp.getOperands();
   if (!applyOp.region().empty() && !operands.empty()) {
@@ -422,6 +423,7 @@ stencil::ApplyOpPattern::cleanupOpArguments(stencil::ApplyOp applyOp,
     auto newOp = rewriter.create<stencil::ApplyOp>(
         loc, applyOp.getResultTypes(), newOperands, applyOp.lb(), applyOp.ub());
 
+    newOp->setAttr("name", applyOp.nameAttr());
     // Compute the argument mapping and move the block
     SmallVector<Value, 10> newArgs(applyOp.getNumOperands());
     llvm::transform(applyOp.getOperands(), newArgs.begin(), [&](Value value) {

@@ -1,0 +1,2 @@
+#!/bin/bash
+oec-opt --canonicalize --custom-fusion="fused_apply=apply_29,apply_31" --custom-fusion="fused_apply=apply_30,apply_29_31" --custom-fusion="fused_apply=apply_28,apply_30_29_31" fastwaves_name.mlir

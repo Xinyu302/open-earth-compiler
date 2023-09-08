@@ -38,8 +38,11 @@ namespace {
 
 // Base class for the stencil inlining patterns
 struct CustomStencilInliningPattern : public ApplyOpPattern {
-  CustomStencilInliningPattern(MLIRContext *context, stencil::ApplyOp customProducerOp, stencil::ApplyOp customConsumerOp, PatternBenefit benefit = 1)
-      : ApplyOpPattern(context, benefit){};
+  CustomStencilInliningPattern(MLIRContext *context, StringRef customProducerOpName, StringRef customConsumerOpName, PatternBenefit benefit = 1)
+      : ApplyOpPattern(context, benefit){
+        this->customProducerOpName = customProducerOpName;
+        this->customConsumerOpName = customConsumerOpName;
+      };
 
   // Check if the the apply operation is the only consumer
   bool hasSingleConsumer(stencil::ApplyOp producerOp,
@@ -89,8 +92,8 @@ struct CustomStencilInliningPattern : public ApplyOpPattern {
   }
 
 public:
-  stencil::ApplyOp customProducerOp;
-  stencil::ApplyOp customConsumerOp;
+  StringRef customProducerOpName;
+  StringRef customConsumerOpName;
 };
 
 // Pattern rerouting output edge via consumer
@@ -133,6 +136,7 @@ struct CustomRerouteRewrite : public CustomStencilInliningPattern {
     auto newOp = rewriter.create<stencil::ApplyOp>(
         consumerOp.getLoc(), newResultTypes, newOperands, consumerOp.lb(),
         consumerOp.ub());
+    newOp->setAttr("name", consumerOp.nameAttr());
     rewriter.mergeBlocks(consumerOp.getBody(), newOp.getBody(),
                          newOp.getBody()->getArguments().take_front(
                              consumerOp.getNumOperands()));
@@ -188,7 +192,7 @@ struct CustomRerouteRewrite : public CustomStencilInliningPattern {
   // Find a match and reroute the outputs of the stencil apply
   LogicalResult matchAndRewrite(stencil::ApplyOp applyOp,
                                 PatternRewriter &rewriter) const override {
-    if (applyOp != customConsumerOp) return failure();
+    if (!applyOp.nameAttr().getValue().equals(customConsumerOpName)) return failure();
     // Reroute input dependency
     for (auto operand : applyOp.operands()) {
       if (operand.getDefiningOp()) {
@@ -199,7 +203,7 @@ struct CustomRerouteRewrite : public CustomStencilInliningPattern {
             if (user == applyOp.getOperation() ||
                 !user->isBeforeInBlock(applyOp))
               continue;
-            if (producerOp != customProducerOp)
+            if (!producerOp.nameAttr().getValue().equals(customProducerOpName))
               continue;
 
             if (isStencilInliningPossible(producerOp, applyOp) &&
@@ -213,7 +217,7 @@ struct CustomRerouteRewrite : public CustomStencilInliningPattern {
     for (auto operand : applyOp.operands()) {
       if (auto producerOp =
               dyn_cast_or_null<stencil::ApplyOp>(operand.getDefiningOp())) {
-        if (producerOp != customProducerOp)
+        if (!producerOp.nameAttr().getValue().equals(customProducerOpName))
           continue;
         if (isStencilInliningPossible(producerOp, applyOp) &&
             isStencilReroutingPossible(producerOp, applyOp))
@@ -244,6 +248,18 @@ struct CustomInliningRewrite : public CustomStencilInliningPattern {
     auto buildOp = rewriter.create<stencil::ApplyOp>(
         loc, consumerOp.getResultTypes(), buildOperands, consumerOp.lb(),
         consumerOp.ub());
+
+    // get producerOp.nameAttr and consumerOp.nameAttr
+    
+    int start = producerOp.nameAttr().getValue().find('_') + 1;
+    std::string producerName = producerOp.nameAttr().getValue().substr(start).str();
+    start = consumerOp.nameAttr().getValue().find('_') + 1;
+    std::string consumerName = consumerOp.nameAttr().getValue().substr(start).str();
+
+    std::string newName = "apply_" + producerName + "_" + consumerName;
+    auto nameAttr = rewriter.getStringAttr(newName);
+    buildOp->setAttr("name", nameAttr);
+
     rewriter.mergeBlocks(consumerOp.getBody(), buildOp.getBody(),
                          buildOp.getBody()->getArguments().take_back(
                              consumerOp.getNumOperands()));
@@ -341,12 +357,12 @@ struct CustomInliningRewrite : public CustomStencilInliningPattern {
 
   LogicalResult matchAndRewrite(stencil::ApplyOp applyOp,
                                 PatternRewriter &rewriter) const override {
-    if (applyOp != customConsumerOp) return failure();
+    if (!applyOp.nameAttr().getValue().equals(customConsumerOpName)) return failure();
     // Search producer apply op
     for (auto operand : applyOp.operands()) {
       if (auto producerOp =
               dyn_cast_or_null<stencil::ApplyOp>(operand.getDefiningOp())) {
-        if (producerOp != customProducerOp)
+        if (!producerOp.nameAttr().getValue().equals(customProducerOpName))
           continue ;
         // Try the next producer if inlining the current one is not possible
         if (isStencilInliningPossible(producerOp, applyOp) &&
@@ -375,6 +391,8 @@ void CustomFusionPass::runOnFunction() {
   std::string producerName = fused_apply[0];
   std::string consumerName = fused_apply[1];
 
+  llvm::errs() << "producerName: " << producerName << "\n";
+  llvm::errs() << "consumerName: " << consumerName << "\n";
   // Verify unrolling has not been executed
   auto result = funcOp.walk([&](stencil::ReturnOp returnOp) {
     if (returnOp.unroll().hasValue()) {
@@ -390,11 +408,15 @@ void CustomFusionPass::runOnFunction() {
   funcOp.walk([&](stencil::ApplyOp applyOp) {
     if (applyOp.nameAttr().getValue() == consumerName) {
       consumerOp = applyOp;
+      llvm::errs() << "find consumerOp\n";
     }
     if (applyOp.nameAttr().getValue() == producerName) {
       producerOp = applyOp;
+      llvm::errs() << "find producerOp\n";
     }
   });
+  llvm::errs() << "consumerOp: " << consumerOp.nameAttr().getValue() << "\n";
+  llvm::errs() << "producerOp: " << producerOp.nameAttr().getValue() << "\n";
   if (!consumerOp || !producerOp) {
     funcOp.emitOpError("could not find stencil apply ops");
   }
@@ -410,7 +432,7 @@ void CustomFusionPass::runOnFunction() {
   //             redirectStore(producerOp, consumerOp, rewriter);
   
   OwningRewritePatternList patterns;
-  patterns.insert<CustomInliningRewrite, CustomRerouteRewrite>(&getContext(), producerOp, consumerOp);
+  patterns.insert<CustomInliningRewrite, CustomRerouteRewrite>(&getContext(), producerOp.nameAttr().getValue(), consumerOp.nameAttr().getValue());
   applyPatternsAndFoldGreedily(funcOp, std::move(patterns));
 
 }
