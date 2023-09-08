@@ -36,17 +36,21 @@ using namespace stencil;
 
 namespace {
 
+// Base class for the stencil inlining patterns
+struct CustomStencilInliningPattern : public ApplyOpPattern {
+  CustomStencilInliningPattern(MLIRContext *context, stencil::ApplyOp customProducerOp, stencil::ApplyOp customConsumerOp, PatternBenefit benefit = 1)
+      : ApplyOpPattern(context, benefit){};
 
-    // Check if the the apply operation is the only consumer
+  // Check if the the apply operation is the only consumer
   bool hasSingleConsumer(stencil::ApplyOp producerOp,
-                         stencil::ApplyOp applyOp){
+                         stencil::ApplyOp applyOp) const {
     return llvm::all_of(producerOp.getOperation()->getUsers(),
                         [&](Operation *op) { return op == applyOp; });
   }
 
   // Check if inlining is possible
   bool isStencilInliningPossible(stencil::ApplyOp producerOp,
-                                 stencil::ApplyOp consumerOp){
+                                 stencil::ApplyOp consumerOp) const {
     // Do not inline producer ops that return void values
     bool containsEmptyStores = false;
     producerOp.walk([&](stencil::StoreResultOp resultOp) {
@@ -69,7 +73,7 @@ namespace {
 
   // Check if rerouting is possible
   bool isStencilReroutingPossible(stencil::ApplyOp producerOp,
-                                  stencil::ApplyOp consumerOp){
+                                  stencil::ApplyOp consumerOp) const {
     // Perform producer consumer inlining instead
     if (hasSingleConsumer(producerOp, consumerOp))
       return false;
@@ -84,43 +88,19 @@ namespace {
     return true;
   }
 
-  stencil::ApplyOp cleanupOpArguments(stencil::ApplyOp applyOp,
-                                            PatternRewriter &rewriter){
-  // Compute the new operand list and index mapping
-  llvm::DenseMap<Value, unsigned int> newIndex;
-  SmallVector<Value, 10> newOperands;
-  for (auto &en : llvm::enumerate(applyOp.getOperands())) {
-    if (newIndex.count(en.value()) == 0) {
-      if (!applyOp.getBody()->getArgument(en.index()).getUses().empty()) {
-        newIndex[en.value()] = newOperands.size();
-        newOperands.push_back(en.value());
-      }
-    }
-  }
+public:
+  stencil::ApplyOp customProducerOp;
+  stencil::ApplyOp customConsumerOp;
+};
 
-  // Create a new operation with shorther argument list
-  if (newOperands.size() < applyOp.getNumOperands()) {
-    auto loc = applyOp.getLoc();
-    auto newOp = rewriter.create<stencil::ApplyOp>(
-        loc, applyOp.getResultTypes(), newOperands, applyOp.lb(), applyOp.ub());
-
-    // Compute the argument mapping and move the block
-    SmallVector<Value, 10> newArgs(applyOp.getNumOperands());
-    llvm::transform(applyOp.getOperands(), newArgs.begin(), [&](Value value) {
-      return newIndex.count(value) == 0
-                 ? nullptr // pass default value if the new apply has no params
-                 : newOp.getBody()->getArgument(newIndex[value]);
-    });
-    rewriter.mergeBlocks(applyOp.getBody(), newOp.getBody(), newArgs);
-    return newOp;
-  }
-  return nullptr;
-}
+// Pattern rerouting output edge via consumer
+struct CustomRerouteRewrite : public CustomStencilInliningPattern {
+  using CustomStencilInliningPattern::CustomStencilInliningPattern;
 
   // Helper method inlining the consumer in the producer
   LogicalResult redirectStore(stencil::ApplyOp producerOp,
                               stencil::ApplyOp consumerOp,
-                              PatternRewriter &rewriter){
+                              PatternRewriter &rewriter) const {
     // Clone the producer op
     rewriter.setInsertionPointAfter(producerOp);
     auto clonedOp = rewriter.cloneWithoutRegions(producerOp);
@@ -205,11 +185,55 @@ namespace {
     return success();
   }
 
+  // Find a match and reroute the outputs of the stencil apply
+  LogicalResult matchAndRewrite(stencil::ApplyOp applyOp,
+                                PatternRewriter &rewriter) const override {
+    if (applyOp != customConsumerOp) return failure();
+    // Reroute input dependency
+    for (auto operand : applyOp.operands()) {
+      if (operand.getDefiningOp()) {
+        for (auto user : operand.getDefiningOp()->getUsers()) {
+          // Only consider other apply operations
+          if (auto producerOp = dyn_cast<stencil::ApplyOp>(user)) {
+            // Only consider other consumers before the apply op
+            if (user == applyOp.getOperation() ||
+                !user->isBeforeInBlock(applyOp))
+              continue;
+            if (producerOp != customProducerOp)
+              continue;
+
+            if (isStencilInliningPossible(producerOp, applyOp) &&
+                isStencilReroutingPossible(producerOp, applyOp))
+              return redirectStore(producerOp, applyOp, rewriter);
+          }
+        }
+      }
+    }
+    // Reroute output dependency
+    for (auto operand : applyOp.operands()) {
+      if (auto producerOp =
+              dyn_cast_or_null<stencil::ApplyOp>(operand.getDefiningOp())) {
+        if (producerOp != customProducerOp)
+          continue;
+        if (isStencilInliningPossible(producerOp, applyOp) &&
+            isStencilReroutingPossible(producerOp, applyOp))
+          return redirectStore(producerOp, applyOp, rewriter);
+      }
+    }
+    return failure();
+  }
+};
+
+// Pattern inlining producer into consumer
+// (assuming the producer has only a single consumer)
+struct CustomInliningRewrite : public CustomStencilInliningPattern {
+  using CustomStencilInliningPattern::CustomStencilInliningPattern;
+
   // Helper method inlining the producer computation
   LogicalResult inlineProducer(stencil::ApplyOp producerOp,
                                stencil::ApplyOp consumerOp,
                                ValueRange producerResults,
-                               PatternRewriter &rewriter){
+                               PatternRewriter &rewriter) const {
     // Concatenate the operands of producer and consumer
     SmallVector<Value, 10> buildOperands = producerOp.getOperands();
     buildOperands.append(consumerOp.getOperands().begin(),
@@ -315,6 +339,26 @@ namespace {
     return success();
   }
 
+  LogicalResult matchAndRewrite(stencil::ApplyOp applyOp,
+                                PatternRewriter &rewriter) const override {
+    if (applyOp != customConsumerOp) return failure();
+    // Search producer apply op
+    for (auto operand : applyOp.operands()) {
+      if (auto producerOp =
+              dyn_cast_or_null<stencil::ApplyOp>(operand.getDefiningOp())) {
+        if (producerOp != customProducerOp)
+          continue ;
+        // Try the next producer if inlining the current one is not possible
+        if (isStencilInliningPossible(producerOp, applyOp) &&
+            hasSingleConsumer(producerOp, applyOp)) {
+          return inlineProducer(producerOp, applyOp, producerOp.getResults(),
+                                rewriter);
+        }
+      }
+    }
+    return failure();
+  }
+};
 
 struct CustomFusionPass
     : public CustomFusionPassBase<CustomFusionPass> {
@@ -326,7 +370,7 @@ void CustomFusionPass::runOnFunction() {
   // Only run on functions marked as stencil programs
   if (!StencilDialect::isStencilProgram(funcOp))
     return;
-  PatternRewriter rewriter(funcOp.getContext());
+//  PatternRewriter rewriter(funcOp.getContext());
   assert(fused_apply.size() == 2);
   std::string producerName = fused_apply[0];
   std::string consumerName = fused_apply[1];
@@ -355,15 +399,19 @@ void CustomFusionPass::runOnFunction() {
     funcOp.emitOpError("could not find stencil apply ops");
   }
 
-  if (isStencilInliningPossible(producerOp, consumerOp) &&
-            hasSingleConsumer(producerOp, consumerOp)) {
-          inlineProducer(producerOp, consumerOp, producerOp.getResults(),
-                                rewriter);
-          return;
-  }
-  if (isStencilInliningPossible(producerOp, consumerOp) &&
-          isStencilReroutingPossible(producerOp, consumerOp))
-              redirectStore(producerOp, consumerOp, rewriter);
+  // if (isStencilInliningPossible(producerOp, consumerOp) &&
+  //           hasSingleConsumer(producerOp, consumerOp)) {
+  //         inlineProducer(producerOp, consumerOp, producerOp.getResults(),
+  //                               rewriter);
+  //         return;
+  // }
+  // if (isStencilInliningPossible(producerOp, consumerOp) &&
+  //         isStencilReroutingPossible(producerOp, consumerOp))
+  //             redirectStore(producerOp, consumerOp, rewriter);
+  
+  OwningRewritePatternList patterns;
+  patterns.insert<CustomInliningRewrite, CustomRerouteRewrite>(&getContext(), producerOp, consumerOp);
+  applyPatternsAndFoldGreedily(funcOp, std::move(patterns));
 
 }
 
