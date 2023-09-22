@@ -186,11 +186,12 @@ LogicalResult openEarthMain(int argc, char **argv, llvm::StringRef toolName,
     // 加载文件
     if(loadMLIR(context, module))
         return failure();
+
     
     context.enableMultithreading(wasThreadingEnabled);
     // Apply any pass manager command line options.
     PassManager pm(&context, OpPassManager::Nesting::Implicit);
-    pm.enableVerifier(verifyPasses);
+//    pm.enableVerifier(verifyPasses);
     applyPassManagerCLOptions(pm);
     
     auto errorHandler = [&](const Twine &msg) {

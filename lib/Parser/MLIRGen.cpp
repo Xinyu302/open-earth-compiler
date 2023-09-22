@@ -65,7 +65,6 @@ public:
         // stencil部分可能返回多个func (多次迭代情况下会返回两个func, 而单次迭代则只会返回一个func)
         for (unsigned i= 0; i < stencil.size(); i++)
             theModule.push_back(stencil[i]);
-
         // 在构建完成后对module进行检查
         if (failed(mlir::verify(theModule))) {
             theModule.emitError("module verfication error");
@@ -95,6 +94,12 @@ private:
     std::vector<int64_t> operationLB;
     std::vector<int64_t> operationUB;
 
+    std::vector<int64_t> computeShape;
+
+    int64_t tileSize;
+    int64_t dim;
+
+
     // 计算函数符号表
     std::map<StringRef, mlir::Value> symbolTable;
     // 迭代函数符号表
@@ -104,7 +109,7 @@ private:
 
     // 辅助函数, 负责将AST中的location转化为MLIR的location
     mlir::Location loc(swsten::Location loc) {
-        return mlir::FileLineColLoc::get(builder.getIdentifier(*loc.file), loc.line, loc.col);
+        return mlir::FileLineColLoc::get(builder.getIdentifier(*loc.file), loc.line, loc.col, builder.getContext());
     }
 
     // 在当前范围内声明一个变量, 如果该变量还未被声明则返回成功, 该函数负责管理计算函数的符号表
@@ -123,6 +128,33 @@ private:
             return mlir::failure();
         iterFuncSymbolTable[name] = value;
         return mlir::success();
+    }
+
+    // 获取空的shape
+    mlir::Type getUnknownType(VarDeclExprAST &varDecl) {
+        auto type = varDecl.getType();
+        auto arrayType = varDecl.getArrayType();
+        std::vector<int64_t> unknownShape(type.shape.size(), -1);
+        if (arrayType == Type_StructArray) {
+            domainType = type;
+        }
+        if (type.elemType == Type_Double)
+            return mlir::stencil::FieldType::get(builder.getF64Type(), unknownShape);
+
+        return mlir::stencil::FieldType::get(builder.getF32Type(), unknownShape);
+    }
+
+    mlir::Type getUnknownTypeTemp(VarDeclExprAST &varDecl) {
+        auto type = varDecl.getType();
+        auto arrayType = varDecl.getArrayType();
+        std::vector<int64_t> unknownShape(type.shape.size(), -1);
+        if (arrayType == Type_StructArray) {
+            domainType = type;
+        }
+        if (type.elemType == Type_Double)
+            return mlir::stencil::TempType::get(builder.getF64Type(), unknownShape);
+
+        return mlir::stencil::TempType::get(builder.getF32Type(), unknownShape);
     }
 
     // 根据给定的维度大小及元素类型构造mlir中类型(数组)
@@ -193,25 +225,38 @@ private:
         // argNames保存了计算函数传参的名称顺序, 同时迭代函数中的stencil.iteration的左半部分传参也使用了同样的顺序
         // argNamesForIterationOp记录了stencil.iteration中右半部分传参的名称顺序
         llvm::SmallVector<mlir::Type, 4> argTypes;
+        llvm::SmallVector<mlir::Type, 4> unknownArgTypes;
+        llvm::SmallVector<mlir::Type, 4> unknownTempTypes;
         llvm::SmallVector<llvm::StringRef, 4> argNames;
         llvm::SmallVector<mlir::StringRef, 4> argNamesForIterationOp;
         for (unsigned i = 0; i < stencilAST.getArgs().size(); i++) {
             auto argItem = stencilAST.getArgs()[i].get();
             mlir::Type type = getType(*argItem);
+            mlir::Type unknownType = getUnknownType(*argItem);
+            mlir::Type unknownTempType = getUnknownTypeTemp(*argItem);
             llvm::StringRef name = (*argItem).getName();
             if (!type)
                 return retFuncList;
 
             if ((*argItem).getArrayType() == Type_StructArray) {
                 // 如果参数是结构化数组, 需要增加写回数组
-                llvm::StringRef outputName = llvm::Twine(name, "_output").str();
+                llvm::StringRef outputName = "_output";
                 // 输入数组
                 argNames.push_back(name);
                 argTypes.push_back(type);
-                // 写回数组
-                argNames.push_back(outputName);
-                argTypes.push_back(type);
-                outputArrayName = outputName;
+                unknownArgTypes.push_back(unknownType);
+                unknownTempTypes.push_back(unknownTempType);
+                if (i == stencilAST.getArgs().size() - 1) {
+                      // 写回数组
+                      argNames.push_back(outputName);
+                      argTypes.push_back(type);
+                      unknownArgTypes.push_back(unknownType);
+                      unknownTempTypes.push_back(unknownTempType);
+                      outputArrayName = outputName;
+                      computeShape = argItem->getType().shape;
+                      tileSize = 4;
+                      dim = computeShape.size();
+                }
 
                 argNamesForIterationOp.push_back(outputName);
                 argNamesForIterationOp.push_back(name);
@@ -225,26 +270,53 @@ private:
         }
 
         // 构造该计算函数头
-        auto computeFuncType = builder.getFunctionType(argTypes, llvm::None);
-        auto stencilProgramAttr = builder.getNamedAttr(mlir::stencil::StencilDialect::getStencilProgarmAttrName(), builder.getUnitAttr());
+        auto computeFuncType = builder.getFunctionType(unknownArgTypes, llvm::None);
+        auto stencilProgramAttr = builder.getNamedAttr(mlir::stencil::StencilDialect::getStencilProgramAttrName(), builder.getUnitAttr());
         llvm::ArrayRef<mlir::NamedAttribute> stencilProgramAttrs(stencilProgramAttr);
         auto computeFuncOp = mlir::FuncOp::create(location, stencilAST.getName(), computeFuncType, stencilProgramAttrs);
         if (!computeFuncOp)
             return retFuncList;
+
+
         
         // 构造计算函数体, 在MLIR中, entryBlock比较特殊, 它必须包含函数参数列表
         auto &entryBlock = *computeFuncOp.addEntryBlock();
-        // 在符号表中声明所有参数
-        for (const auto &name_value : llvm::zip(argNames, entryBlock.getArguments())) {
-            if (failed(declare(std::get<0>(name_value), std::get<1>(name_value))))
-                return retFuncList;
-        }
-
         // 给computeFuncOp添加终结符号
         builder.setInsertionPointToEnd(&entryBlock);
         builder.create<ReturnOp>(location);
-        // 将插入点设置到函数体的开头
+
         builder.setInsertionPointToStart(&entryBlock);
+        llvm::SmallVector<Value> castOps;
+        for (const auto &name_value : llvm::zip(argNames, argTypes, entryBlock.getArguments())) {
+        // 在符号表中声明所有参数
+            std::vector<int64_t> lb(dim, -tileSize);
+            std::vector<int64_t> ub;
+            for (int dim_iter = 0; dim_iter < 3; dim_iter++) {
+                ub.push_back(computeShape[dim_iter] - tileSize);
+            }
+            auto LBAttr = builder.getI64ArrayAttr(llvm::ArrayRef<int64_t>(lb));
+            auto UBAttr = builder.getI64ArrayAttr(llvm::ArrayRef<int64_t>(ub));
+            Value castOp = builder.create<stencil::CastOp>(location, std::get<1>(name_value), std::get<2>(name_value), LBAttr, UBAttr);
+//            if (failed(declare(std::get<0>(name_value), castOp)))
+//                return retFuncList;
+            castOps.push_back(castOp);
+
+        }
+
+        for (const auto &name_value: llvm::zip(argNames, castOps, unknownTempTypes)) {
+            if (std::get<0>(name_value) != outputArrayName) {
+                Value loadOp = builder.create<stencil::LoadOp>(location, std::get<2>(name_value), std::get<1>(name_value));
+                if (failed(declare(std::get<0>(name_value), loadOp)))
+                    return retFuncList;
+            } else {
+                if (failed(declare(std::get<0>(name_value), std::get<1>(name_value))))
+                    return retFuncList;
+            }
+        }
+
+
+        // 将插入点设置到函数体的开头
+//        builder.setInsertionPointToStart(&entryBlock);
         // 生成函数体内部(kernel)的内容
         auto kernelList = std::move(stencilAST.getKernelList());
         for (unsigned kernelASTIter = 0; kernelASTIter < kernelList.size(); kernelASTIter++) {
@@ -256,13 +328,20 @@ private:
             builder.setInsertionPoint(&(entryBlock.back()));
         }
 
+
+
         // 生成stencil.copy操作将operation标定的kernel生成的结果写回到输出数组
         auto outputArray = symbolTable[outputArrayName];
         auto writeBackResult = symbolTable[stencilAST.getOperation()];
+        std::vector<int64_t> lb(dim);
+        std::vector<int64_t> ub;
+        for (int iter = 0; iter < dim; iter++) {
+            ub.push_back(computeShape[iter] - 2 * tileSize);
+        }
         // 根据operation的上下界生成copy的上下界(两者上下界是相同的)
-        auto copyLB = builder.getI64ArrayAttr(llvm::ArrayRef<int64_t>(operationLB));
-        auto copyUB = builder.getI64ArrayAttr(llvm::ArrayRef<int64_t>(operationUB));
-        builder.create<stencil::CopyOp>(location, writeBackResult, outputArray, copyLB, copyUB);
+        auto copyLB = builder.getI64ArrayAttr(llvm::ArrayRef<int64_t>(lb));
+        auto copyUB = builder.getI64ArrayAttr(llvm::ArrayRef<int64_t>(ub));
+        builder.create<stencil::StoreOp>(location, writeBackResult, outputArray, copyLB, copyUB);
 
         // 记录计算函数
         retFuncList.push_back(computeFuncOp);
@@ -270,86 +349,86 @@ private:
         /************ 生成多次迭代部分的函数 *************/
         // 该部分的函数与计算函数相同, 所以可以直接使用
         // 构造迭代部分计算函数头
-        auto iterationFuncType = builder.getFunctionType(argTypes, llvm::None);
-        auto stencilIterationAttr = builder.getNamedAttr(mlir::stencil::StencilDialect::getStencilIterationAttrName(), builder.getUnitAttr());
-        std::vector<mlir::NamedAttribute> stencilIterationAttrVec;
-        stencilIterationAttrVec.push_back(stencilIterationAttr);
-        llvm::ArrayRef<mlir::NamedAttribute> stencilIterationAttrs(stencilIterationAttrVec);
-        auto iterationFuncOp = mlir::FuncOp::create(location, llvm::Twine(stencilAST.getName(), "_iteration").str(), iterationFuncType, stencilIterationAttrs);
-        if (!iterationFuncOp) {
-            retFuncList.clear();
-            return retFuncList;
-        }
+        // auto iterationFuncType = builder.getFunctionType(argTypes, llvm::None);
+        // auto stencilIterationAttr = builder.getNamedAttr(mlir::stencil::StencilDialect::getStencilIterationAttrName(), builder.getUnitAttr());
+        // std::vector<mlir::NamedAttribute> stencilIterationAttrVec;
+        // stencilIterationAttrVec.push_back(stencilIterationAttr);
+        // llvm::ArrayRef<mlir::NamedAttribute> stencilIterationAttrs(stencilIterationAttrVec);
+        // auto iterationFuncOp = mlir::FuncOp::create(location, llvm::Twine(stencilAST.getName(), "_iteration").str(), iterationFuncType, stencilIterationAttrs);
+        // if (!iterationFuncOp) {
+        //     retFuncList.clear();
+        //     return retFuncList;
+        // }
 
-        // 构造迭代函数体, 在MLIR中 entryBlock比较特殊, 它必须包含函数参数列表
-        auto &iterationFuncEntryBlock = *iterationFuncOp.addEntryBlock();
-        // 在符号表中声明所有参数
-        for (const auto &name_value : llvm::zip(argNames, iterationFuncEntryBlock.getArguments())) {
-            if (failed(declareIterFunc(std::get<0>(name_value), std::get<1>(name_value)))) {
-                retFuncList.clear();
-                return retFuncList;
-            }
-        }
+        // // 构造迭代函数体, 在MLIR中 entryBlock比较特殊, 它必须包含函数参数列表
+        // auto &iterationFuncEntryBlock = *iterationFuncOp.addEntryBlock();
+        // // 在符号表中声明所有参数
+        // for (const auto &name_value : llvm::zip(argNames, iterationFuncEntryBlock.getArguments())) {
+        //     if (failed(declareIterFunc(std::get<0>(name_value), std::get<1>(name_value)))) {
+        //         retFuncList.clear();
+        //         return retFuncList;
+        //     }
+        // }
 
-        // 给computeFuncOp添加终结符号
-        builder.setInsertionPointToEnd(&iterationFuncEntryBlock);
-        builder.create<ReturnOp>(location);
-        // 将插入点设置到迭代函数的开头
-        builder.setInsertionPointToStart(&iterationFuncEntryBlock);
-        // 生成迭代函数体内的内容, 实际上只生成一个stencil.iteration操作
-        // 准备传入参数
-        llvm::SmallVector<mlir::Value, 4> iterFuncOpArg;
-        // 首先处理传入参数左半部分
-        for (auto iter = argNames.begin(); iter != argNames.end(); iter++) {
-            mlir::Value item = iterFuncSymbolTable[*iter];
-            iterFuncOpArg.push_back(item);
-        }
+        // // 给computeFuncOp添加终结符号
+        // builder.setInsertionPointToEnd(&iterationFuncEntryBlock);
+        // builder.create<ReturnOp>(location);
+        // // 将插入点设置到迭代函数的开头
+        // builder.setInsertionPointToStart(&iterationFuncEntryBlock);
+        // // 生成迭代函数体内的内容, 实际上只生成一个stencil.iteration操作
+        // // 准备传入参数
+        // llvm::SmallVector<mlir::Value, 4> iterFuncOpArg;
+        // // 首先处理传入参数左半部分
+        // for (auto iter = argNames.begin(); iter != argNames.end(); iter++) {
+        //     mlir::Value item = iterFuncSymbolTable[*iter];
+        //     iterFuncOpArg.push_back(item);
+        // }
 
-        // 然后处理传入参数右半部分
-        for (auto iter = argNamesForIterationOp.begin(); iter != argNamesForIterationOp.end(); iter++) {
-            mlir::Value item = iterFuncSymbolTable[*iter];
-            iterFuncOpArg.push_back(item);
-        }
+        // // 然后处理传入参数右半部分
+        // for (auto iter = argNamesForIterationOp.begin(); iter != argNamesForIterationOp.end(); iter++) {
+        //     mlir::Value item = iterFuncSymbolTable[*iter];
+        //     iterFuncOpArg.push_back(item);
+        // }
 
-        int bindParamNum = argNames.size();
-        int iterationNum = stencilAST.getIteration();
+        // int bindParamNum = argNames.size();
+        // int iterationNum = stencilAST.getIteration();
 
-        if (iterationNum != 1 && iterationNum%2 != 0) {
-            emitError(location) << "expect iteration num is 1 or a multiple of 2";
-            retFuncList.clear();
-            return retFuncList;
-        }
-        // 获取mpiTile
-        std::vector<int64_t> mpiTile = stencilAST.getMpiTile();
-        // 获取mpiHalo, 并将其分成mpiHaloL和mpiHaloU
-        // mpiHaloL中存储的是偏移量为负的数字部分
-        // mpiHaloU中存储的是偏移量为正的数字部分
-        std::vector<int64_t> mpiHaloL;
-        std::vector<int64_t> mpiHaloU;
-        std::vector<std::pair<int64_t, int64_t>> mpiHaloLAndU = stencilAST.getMpiHalo();
-        for (auto iter = mpiHaloLAndU.begin(); iter != mpiHaloLAndU.end(); iter++) {
-            mpiHaloL.push_back(iter->first);
-            mpiHaloU.push_back(iter->second);
-        }
-        // 参数转化, 如果对应的参数存在, 则生成相应的传参, 否则对应传参为空
-        llvm::Optional<llvm::ArrayRef<int64_t>> mpiTile_param = llvm::Optional<llvm::ArrayRef<int64_t>>();
-        llvm::Optional<llvm::ArrayRef<int64_t>> mpiHaloL_param = llvm::Optional<llvm::ArrayRef<int64_t>>();
-        llvm::Optional<llvm::ArrayRef<int64_t>> mpiHaloU_param = llvm::Optional<llvm::ArrayRef<int64_t>>();
-        if (mpiTile.size() != 0)
-            mpiTile_param = llvm::ArrayRef<int64_t>(mpiTile);
-        if (mpiHaloL.size() != 0 && mpiHaloU.size() != 0) {
-            mpiHaloL_param = llvm::ArrayRef<int64_t>(mpiHaloL);
-            mpiHaloU_param = llvm::ArrayRef<int64_t>(mpiHaloU);
-        }
-        if (iterationNum != 1) {
-            // 创建stencil.iteration操作
-            builder.create<stencil::IterationOp>(location, 
-                            builder.getSymbolRefAttr(computeFuncOp.getName()), 
-                            iterFuncOpArg, iterationNum/2, bindParamNum, 
-                            mpiTile_param, mpiHaloL_param, mpiHaloU_param);
-            // 记录迭代函数
-            retFuncList.push_back(iterationFuncOp);
-        }
+        // if (iterationNum != 1 && iterationNum%2 != 0) {
+        //     emitError(location) << "expect iteration num is 1 or a multiple of 2";
+        //     retFuncList.clear();
+        //     return retFuncList;
+        // }
+        // // 获取mpiTile
+        // std::vector<int64_t> mpiTile = stencilAST.getMpiTile();
+        // // 获取mpiHalo, 并将其分成mpiHaloL和mpiHaloU
+        // // mpiHaloL中存储的是偏移量为负的数字部分
+        // // mpiHaloU中存储的是偏移量为正的数字部分
+        // std::vector<int64_t> mpiHaloL;
+        // std::vector<int64_t> mpiHaloU;
+        // std::vector<std::pair<int64_t, int64_t>> mpiHaloLAndU = stencilAST.getMpiHalo();
+        // for (auto iter = mpiHaloLAndU.begin(); iter != mpiHaloLAndU.end(); iter++) {
+        //     mpiHaloL.push_back(iter->first);
+        //     mpiHaloU.push_back(iter->second);
+        // }
+        // // 参数转化, 如果对应的参数存在, 则生成相应的传参, 否则对应传参为空
+        // llvm::Optional<llvm::ArrayRef<int64_t>> mpiTile_param = llvm::Optional<llvm::ArrayRef<int64_t>>();
+        // llvm::Optional<llvm::ArrayRef<int64_t>> mpiHaloL_param = llvm::Optional<llvm::ArrayRef<int64_t>>();
+        // llvm::Optional<llvm::ArrayRef<int64_t>> mpiHaloU_param = llvm::Optional<llvm::ArrayRef<int64_t>>();
+        // if (mpiTile.size() != 0)
+        //     mpiTile_param = llvm::ArrayRef<int64_t>(mpiTile);
+        // if (mpiHaloL.size() != 0 && mpiHaloU.size() != 0) {
+        //     mpiHaloL_param = llvm::ArrayRef<int64_t>(mpiHaloL);
+        //     mpiHaloU_param = llvm::ArrayRef<int64_t>(mpiHaloU);
+        // }
+        // if (iterationNum != 1) {
+        //     // 创建stencil.iteration操作
+        //     builder.create<stencil::IterationOp>(location, 
+        //                     builder.getSymbolRefAttr(computeFuncOp.getName()), 
+        //                     iterFuncOpArg, iterationNum/2, bindParamNum, 
+        //                     mpiTile_param, mpiHaloL_param, mpiHaloU_param);
+        //     // 记录迭代函数
+        //     retFuncList.push_back(iterationFuncOp);
+        // }
         return retFuncList;
     }
 
@@ -365,6 +444,7 @@ private:
         // 获取上下界
         std::vector<int64_t> kernelLB;
         std::vector<int64_t> kernelUB;
+        llvm::SmallVector<mlir::Attribute, 2> empty_attr = {};
         std::vector<std::pair<int64_t, int64_t>> lbAndUb = kernelAST.getDomainRange();
 
         for (auto iter = lbAndUb.begin(); iter != lbAndUb.end(); iter++) {
@@ -395,13 +475,12 @@ private:
         // 返回结果的类型与(问题域的)输入数组中结构化数组的类型相同
         mlir::Type kernelResultType; 
         if (domainType.elemType == Type_Double)
-            kernelResultType = mlir::stencil::FieldType::get(builder.getF64Type(), domainType.shape);
+            kernelResultType = mlir::stencil::TempType::get(builder.getF64Type(), std::vector<int64_t>(domainType.shape.size(), -1));
         else 
-            kernelResultType = mlir::stencil::FieldType::get(builder.getF32Type(), domainType.shape);
+            kernelResultType = mlir::stencil::TempType::get(builder.getF32Type(), std::vector<int64_t>(domainType.shape.size(), -1));
 
         // 创建apply操作
-        auto applyOp = builder.create<stencil::ApplyOp>(loc(location), args, kernelLB, kernelUB, \
-                kernelAST.getTile(), kernelAST.getSWCacheAt(), kernelResultType);
+        auto applyOp = builder.create<stencil::ApplyOp>(loc(location), kernelResultType, args, llvm::Optional<mlir::ArrayAttr>(), llvm::Optional<mlir::ArrayAttr>());
 
         // 建立输入数组名称与block中value的绑定关系, 是kernel部分的符号表
         auto entryBlock = applyOp.getBody();
@@ -422,7 +501,7 @@ private:
             return failure();
 
         // 生成stencil.store操作
-        auto storeResult = builder.create<stencil::StoreOp>(loc(location), resultValue);
+        auto storeResult = builder.create<stencil::StoreResultOp>(loc(location), resultValue);
 
         // 生成stencil.return操作
         auto returnOp = builder.create<stencil::ReturnOp>(loc(location), storeResult.getResult(), llvm::Optional<mlir::ArrayAttr>());
@@ -496,8 +575,8 @@ private:
         if (array.getArrayType() == Type_StructArray)
             return builder.create<stencil::AccessOp>(location, arrayValue, llvm::ArrayRef<int64_t>(index));
 
-        // 否则是参数数组, 采用stencil.load进行访问
-        return builder.create<stencil::LoadOp>(location, arrayValue, index);
+//         否则是参数数组, 采用stencil.load进行访问
+//        return builder.create<stencil::LoadOp>(location, arrayValue, index);
     }
 
 };

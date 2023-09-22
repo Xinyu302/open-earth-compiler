@@ -462,7 +462,7 @@ def Stencil_ApplyOp : Stencil_Op<"apply", [
       region->front().addArguments(operands.getTypes());
       $_state.addTypes(resultTypes);
     }]>,
-    OpBuilderDAG<(ins "TypeRange":$resultTypes, "Optional<ArrayAttr>":$lb, "Optional<ArrayAttr>":$ub), 
+    OpBuilderDAG<(ins "TypeRange":$resultTypes, "Optional<ArrayAttr>":$lb, "Optional<ArrayAttr>":$ub),
     [{
       if(lb.hasValue() && ub.hasValue()) {
         $_state.addAttribute(getLBAttrName(), lb.getValue());
